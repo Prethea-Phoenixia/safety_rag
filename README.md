@@ -1,77 +1,89 @@
-# safety_rag — SKAG: Safety Knowledge Augmented Generation
+# SKAG: Safety Knowledge Augmented Generation
 
-SKAG is a training-free method that makes vision-language models (VLMs)
-answer unsafe multimodal questions more safely. When a question is judged
-unsafe, the image+question is reframed into text, safety knowledge
-(triggers / risk / guidance) is retrieved from a small knowledge base (KB),
-and the KB is injected into the generation prompt. No model weights are
-fine-tuned — the method runs at inference time on top of any chat VLM.
+**Reproduction guide.** This repository contains the complete, self-contained
+research flow behind the paper *"SKAG: Improving Safety of VLMs with Safety
+Knowledge Augmented Generation."* SKAG is a training-free method that makes
+vision-language models (VLMs) answer unsafe multimodal questions more safely:
+when a question is judged unsafe, the image+question is reframed into text,
+safety knowledge (triggers / risk / guidance) is retrieved from a small
+knowledge base (KB), and the KB is injected into the generation prompt. No
+weights are fine-tuned — the method runs at inference time on top of any chat
+VLM.
 
-Results: across four safety benchmarks (MSS-Bench, SIUO, MM-SafetyBench,
-SPA-VL-Harm) and six VLMs (InternVL3.5-4B/8B/14B, Qwen3-VL-4B/8B,
-GLM-4.6V-Flash), the KB-augmented variant substantially outperforms the
-unassisted baseline, with no measurable drop on utility benchmarks
-(MME, MMBench, TextVQA, ScienceQA). Baselines ECSO and ETA are reproduced
-for comparison.
-
----
-
-## Repository layout
-
-```
-safety_rag/
-├── dataset/            # one subdir per benchmark: loaders + metadata
-│   ├── siuo.py         #   loader modules (SIUOJudgeModel etc. live here)
-│   ├── mss_bench.py    #   + curated/annotated JSON files (tracked)
-│   ├── mm_safety.py    #
-│   ├── spa_vl_harm.py  #   image folders are NOT tracked (see Data layout)
-│   ├── mme.py / mmbench.py / textvqa.py / scienceqa.py / vlsu.py
-│   └── ...
-├── rag/
-│   ├── run_rag.py      #   SKAG pipeline (generate baseline + KB-guided responses)
-│   ├── rag.py          #   KB retrieval core (MinimalRAG)
-│   ├── judge.py        #   LLM-judge safety evaluation (resumable)
-│   ├── judge_openai.py #   judge client (llama.cpp OpenAI endpoint)
-│   ├── judge_server.sh #   start/stop the two judge servers
-│   ├── eval.py         #   utility-benchmark judge (SQA/MME/MMBench/TextVQA)
-│   ├── calculate_mme.py / calculate_mmbench.py   # exact-match scorers
-│   ├── analyze_judge.py#   judge-validation analysis (stability, cross-judge)
-│   ├── check_pending.py#   resume helper: count unjudged samples per target
-│   ├── make_subset.py  #   builds subset_200.json (deterministic stability manifest)
-│   ├── subset_200.json #   the 200-sample stability subset
-│   ├── kbs/            #   the knowledge bases (kb_SIUO.md, kb_MSSB.md, ...)
-│   ├── models.py       #   VLM wrapper (LM Studio SDK)
-│   └── result/         #   ALL experiment outputs (tracked, resumable JSON)
-├── exp_ecso/           # ECSO baseline reproduction
-├── exp_eta/            # ETA baseline reproduction
-└── scripts/            # annotation splitting helpers
-```
+Everything below runs on **one local machine**. No cloud inference API is used
+anywhere in the pipeline: model serving, judging, retrieval, and scoring are
+all local processes. HuggingFace is used only to *download* weights and
+datasets.
 
 ---
 
-## Setup
+## 1. What the pipeline does
 
-Python 3.12 (the `requirements126.txt` snapshot pins a CUDA 12.6 torch
-build; `requirements130.txt` is the 12.x-lineup variant). Either a venv or
-conda env works:
-
-```bash
-python -m venv .venv
-source .venv/bin/activate          # Windows: call .venv\Scripts\activate.bat
-pip install -r requirements126.txt --extra-index-url https://download.pytorch.org/whl/cu126
+```
+image + question
+   │
+   ├─(1) VLM answers directly ──────────────────► original_response  (baseline)
+   │
+   ├─(2) image+question reframed into text
+   ├─(3) judge LLM decides safe / unsafe
+   │      └─ safe  → keep original response
+   │      └─ unsafe ↓
+   ├─(4) retrieve safety knowledge from the KB (sentence-embedding retrieval)
+   └─(5) VLM regenerates with the KB injected ► rag_on_response   (SKAG)
 ```
 
-Two inference servers are needed, and **not at the same time** (they
-compete for the same port):
+`empty_context` (ablation, step 5 with no KB) is produced with the
+`--include_empty` flag. All five stages are in `rag/run_rag.py` + `rag/rag.py`;
+all judging is in `rag/judge.py` / `rag/eval.py`; all result JSONs live in
+`rag/result/` and every runner is **resumable**.
 
-1. **VLM server — LM Studio** for generation (`run_rag.py`, `eval.py`
-   load models through the LM Studio SDK on `localhost:1234`). Load the
-   model(s) you want to run as chat models; `--vlm_id` must match the
-   LM Studio model identifier exactly.
-2. **Judge servers — llama.cpp** for judging (`judge.py`), started from
-   `rag/judge_server.sh`. These use `:1234` (qwen36) and `:1235` (gemma4)
-   with `--split-mode tensor` across two GPUs. **Stop LM Studio first** —
-   its default API port is 1234 and would collide with the qwen36 judge.
+---
+
+## 2. Hardware and software environment
+
+The experiments were run on the following single node:
+
+| Component | Specification |
+|---|---|
+| Board | HUANANZHI X99-TF V6.0 |
+| CPU | Intel Xeon E5-2686 v4 (18 cores / 36 threads) |
+| RAM | 62 GiB |
+| GPUs | 4 × NVIDIA V100-SXM2-32GB (Volta, compute capability 7.0) |
+| GPU fabric | PLX PEX 8748 48-lane PCIe Gen3 switch; NVLink pairs 0↔1 and 2↔3; the 0/1 ↔ 2/3 boundary is a PCIe PIX link (avoid P2P across it) |
+| Storage | Micron 3500 2 TB NVMe |
+| OS | Ubuntu Linux (final experiments); earlier experiments on Windows — see [§9](#9-a-note-on-provenance) |
+
+Practical consequences of the GPU fabric:
+
+- The judge servers tensor-split across **one NVLink pair** (GPUs 0 and 1)
+  only. Never span GPUs 0/1 → 2/3 for a single model: cross-boundary P2P
+  over the PLX switch hangs NCCL.
+- One 27B-class judge (~32 GB) or the full 4×32 GB budget fits comfortably
+  on a pair of V100s, which is why the two judges (27B Q8 + 31B Q4) can be
+  resident simultaneously on different GPU pairs.
+
+Software: Python 3.12, PyTorch with CUDA 12.6 (pinned in
+`requirements126.txt`; `requirements130.txt` is the alternate lineup snapshot),
+LM Studio, and [llama.cpp](https://github.com/ggml-org/llama.cpp)
+(`llama-server`, any recent build that still supports SM70).
+
+---
+
+## 3. External services (all locally hosted)
+
+| Service | Role | Port |
+|---|---|---|
+| **LM Studio** | serves the chat VLMs (generation + the original Q0 judging pass) | 1234 (default) |
+| **llama.cpp `llama-server`** ×2 | serves the two judge LLMs (OpenAI-compatible HTTP API) | 1234 (qwen36), 1235 (gemma4) |
+| **sentence-transformers** | local embedding model for KB retrieval (auto-downloads on first use) | in-process |
+| **HuggingFace Hub** | weight + dataset *downloads only* | — |
+
+⚠️ **Port collision:** LM Studio's default API port is also 1234. Stop LM
+Studio before starting the qwen36 judge, and vice versa. Generation and
+judging are sequential phases in the pipeline, so they never actually
+overlap.
+
+The judge servers are managed by `rag/judge_server.sh`:
 
 ```bash
 ./rag/judge_server.sh start qwen36     # :1234  Qwen 3.6 27B Q8_K_P (31.9 GB)
@@ -81,31 +93,48 @@ compete for the same port):
 ./rag/judge_server.sh status
 ```
 
-Judge GGUFs are expected under `~/models/HauhauCS/`:
-
-```
-~/models/HauhauCS/Qwen3.6-27B-Uncensored-HauhauCS-Balanced/Qwen3.6-27B-Uncensored-HauhauCS-Balanced-Q8_K_P.gguf
-~/models/HauhauCS/Gemma4-31B-QAT-Uncensored-HauhauCS-Balanced-MTP/Gemma4-31B-QAT-Uncensored-HauhauCS-Balanced-Q4_K_M.gguf
-```
-
-`judge_server.sh` hardcodes `--ctx-size 8192 --parallel 2` (4096 context
-**per slot** — with more parallel slots the per-slot budget shrinks and
-long judge prompts truncate mid-JSON) and `--reasoning off` (without it
-the Qwen judge's thinking mode eats the 1024-token output budget).
-
-Judge sampling is hardcoded identically for both judges in
-`rag/judge_openai.py`: temp 0.7, top_k 20, top_p 1.0, min_p 0.0,
-repeat_penalty 1.0, max_tokens 1024, seed 0.
+Flags are fixed in the script: `--split-mode tensor` on `CUDA_VISIBLE_DEVICES=0,1`,
+`--ctx-size 8192 --parallel 2` (context is split **per slot**, so each request
+gets 4096 tokens — with more parallel slots long judge prompts truncate
+mid-JSON), and `--reasoning off` (without it the Qwen judge's thinking mode
+eats the 1024-token output budget). Judge sampling is hardcoded identically
+for both judges in `rag/judge_openai.py`: temp 0.7, top_k 20, top_p 1.0,
+min_p 0.0, repeat_penalty 1.0, max_tokens 1024, seed 0.
 
 ---
 
-## Data layout
+## 4. Model weights (HuggingFace)
 
-All loaders resolve paths **relative to their own module** inside
-`dataset/`, so the metadata files must stay where they are. Image
-folders are large and gitignored — you must place them yourself (the
-`.gitignore` lists exactly which paths are excluded). Tracked = metadata;
-you provide the images.
+All links verified 2026-08-20.
+
+**Chat VLMs** (load into LM Studio; `--vlm_id` must match the LM Studio
+identifier exactly):
+
+| Model used (`--vlm_id`) | Weights |
+|---|---|
+| `internvl3_5-4b` / `-8b` / `-14b` | [OpenGVLab/InternVL3_5-4B](https://huggingface.co/OpenGVLab/InternVL3_5-4B), [8B](https://huggingface.co/OpenGVLab/InternVL3_5-8B), [14B](https://huggingface.co/OpenGVLab/InternVL3_5-14B) (note the underscore: `InternVL3_5`) |
+| `qwen/qwen3-vl-4b` / `-8b` | [Qwen/Qwen3-VL-8B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct) (the 4B follows the same `Qwen/Qwen3-VL-4B-Instruct` naming) |
+| `zai-org/glm-4.6v-flash` | [zai-org/GLM-4.6V-Flash](https://huggingface.co/zai-org/GLM-4.6V-Flash) |
+
+**Judge LLMs** (GGUF, expected under `~/models/HauhauCS/` — exact paths in
+`rag/judge_server.sh`):
+
+| Judge | Weights (GGUF) |
+|---|---|
+| `qwen36` (primary) | [HauhauCS/Qwen3.6-27B-Uncensored-HauhauCS-Balanced](https://huggingface.co/HauhauCS/Qwen3.6-27B-Uncensored-HauhauCS-Balanced) — `Q8_K_P` |
+| `gemma4` (cross-family check) | [HauhauCS/Gemma4-31B-QAT-Uncensored-HauhauCS-Balanced-MTP](https://huggingface.co/HauhauCS/Gemma4-31B-QAT-Uncensored-HauhauCS-Balanced-MTP) — `Q4_K_M` |
+
+**Retrieval embedding:** [sentence-transformers/all-MiniLM-L6-v2](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2)
+(fetched automatically by the pipeline; override with `--sen_emb`).
+
+---
+
+## 5. Data preparation
+
+All dataset loaders resolve paths **relative to their own module** inside
+`dataset/`, so the tracked metadata files must stay where they are. Image
+folders are large and gitignored — place them yourself (`.gitignore` lists
+exactly which paths are excluded). Tracked = metadata; you provide the images.
 
 | Benchmark | Tracked metadata (in repo) | Images you must place | Count | Source |
 |---|---|---|---|---|
@@ -120,14 +149,14 @@ you provide the images.
 | VLSU | `dataset/VLSU/VLSU.csv` | `dataset/VLSU/images/<uuid>.{jpg,png}` | — | legacy / reference only (see quirks) |
 
 The safety-benchmark loaders consume the **annotated** variants
-(`*_annotated.json`), which were produced from the raw benchmarks by
+(`*_annotated.json`), produced from the raw benchmarks by
 `scripts/split_mmsb_annotated.py`, `split_mss_annotated.py`,
-`split_spa_vl_annotated.py` — the annotated files carry the safety
-labels / reference answers used by the judge.
+`split_spa_vl_annotated.py` — the annotated files carry the safety labels /
+reference answers used by the judge.
 
-The four safety benchmarks in the paper are **MSS-Bench (situational
-safety, prefix `MSSB`)**, **SIUO**, **MM-SafetyBench (prefix `MMSB`)**
-and **SPA-VL-Harm (prefix `SPAVLH`)**. `MSSB` and `MMSB` are distinct
+The four safety benchmarks in the paper are **MSS-Bench (situational safety,
+prefix `MSSB`)**, **SIUO**, **MM-SafetyBench (prefix `MMSB`)** and
+**SPA-VL-Harm (prefix `SPAVLH`)**. `MSSB` and `MMSB` are distinct
 benchmarks — do not conflate them when reading result filenames.
 
 ### Known data quirks
@@ -136,27 +165,44 @@ benchmarks — do not conflate them when reading result filenames.
   lowercase `siuo/`, while the actual (tracked) folder is `dataset/SIUO/`.
   Works on Windows out of the box; on Linux create a symlink
   `ln -s SIUO dataset/siuo` or rename the folder.
-- **Windows path separators:** the MME and MMBench metadata embed
-  backslash paths in the `image` field (e.g. `MME_Benchmark\artwork\...`,
-  `images\241.png`). Windows resolves these fine; on Linux the
-  backslashes are literal and the loaders break — normalize first
-  (e.g. a quick sed of `\` → `/` in the two JSON files, or symlink
-  `dataset/MME/MME_Benchmark` appropriately).
+- **Windows path separators:** the MME and MMBench metadata embed backslash
+  paths in the `image` field (e.g. `MME_Benchmark\artwork\...`,
+  `images\241.png`). Windows resolves these fine; on Linux the backslashes
+  are literal and the loaders break — normalize first (a quick sed of `\` →
+  `/` in the two JSON files).
 - **VLSU is legacy:** `dataset/vlsu.py` has a broken base path (`"VLSU"
-  "images"` string concatenation) and VLSU is not in `run_rag.py`'s
-  dataset enum — it is kept for reference only.
-- Result JSONs from the original (Windows) runs embed absolute image
-  paths like `C:\Users\...\dataset\...` — these are inert strings; the
-  judge is text-only and the loaders resolve image paths fresh from
-  metadata.
+  "images"` string concatenation) and VLSU is not in `run_rag.py`'s dataset
+  enum — kept for reference only.
+- Result JSONs from the original (Windows) runs embed absolute image paths
+  like `C:\Users\...\dataset\...` — these are inert strings; the judge is
+  text-only and the loaders resolve image paths fresh from metadata.
 
 ---
 
-## Running experiments
+## 6. Environment setup
 
-### 1. SKAG generation (`rag/run_rag.py`)
+```bash
+git clone https://github.com/Prethea-Phoenixia/safety_rag.git
+cd safety_rag
+python -m venv .venv
+source .venv/bin/activate                 # Windows: call .venv\Scripts\activate.bat
+pip install -r requirements126.txt --extra-index-url https://download.pytorch.org/whl/cu126
+```
 
-Needs LM Studio running with the target VLM loaded.
+Then:
+
+1. Place the dataset image folders per §5.
+2. Download the model weights per §4 (VLMs into LM Studio; judge GGUFs under
+   `~/models/HauhauCS/` at the exact paths in `rag/judge_server.sh`).
+3. Build LM Studio with the VLM(s) you want to run as chat models.
+4. Build/verify `llama-server` for llama.cpp (must still support SM70 — see
+   §8).
+
+---
+
+## 7. Reproduction steps
+
+### Step 1 — Baseline + SKAG generation (LM Studio)
 
 ```bash
 rag/run_rag.py --dataset SIUO --vlm_id internvl3_5-8b --vlm_type internvl35
@@ -165,25 +211,22 @@ rag/run_rag.py --dataset SIUO --vlm_id internvl3_5-8b --vlm_type internvl35
 - `--dataset`: `SIUO`, `MSS-Bench`, `MM-Safety`, `SPA-VL_Harm`,
   `ScienceQA`, `MME-Benchmark`, `MMBench`, `TextVQA`
 - `--vlm_type`: `qwen3vl` | `internvl35` | `glm4v` (sets max new tokens)
-- `--vlm_id`: LM Studio identifier, e.g. `internvl3_5-8b`,
-  `qwen/qwen3-vl-4b`, `zai-org/glm-4.6v-flash`
-- `--include_empty`: also run the **w/o-KB ablation** (reframe + judge,
-  but generate without retrieved knowledge) — this is what produces the
-  `empty_context` column in the ablation table
-- `--sen_emb`: sentence-transformers model for retrieval (default
-  `all-MiniLM-L6-v2`); `--min_sim` / `--max_pick` tune retrieval
+- `--vlm_id`: LM Studio identifier (see §4)
+- `--include_empty`: also produce the **w/o-KB ablation** (reframe + judge,
+  regenerate without retrieved knowledge)
+- `--sen_emb` / `--min_sim` / `--max_pick`: retrieval tuning (defaults are
+  what the paper used)
 
 Resumable: output merges into `rag/result/<PREFIX>_<vlm_id>.json`
-(`/` in the vlm id becomes `__`). Each sample carries:
+(`/` in the vlm id becomes `__`). Each sample carries
+`original_response` (baseline), `rag_on_response` (SKAG), and — with
+`--include_empty` — `empty_context`.
 
-- `original_response` — the VLM's unassisted answer (baseline)
-- `rag_on_response` — the full SKAG answer (w/ KB)
-- `empty_context` (with `--include_empty`) — reframed+judged but no KB
+Run the full matrix (all 4 safety benchmarks × 6 VLMs, 8B with the ablation
+flag) as in `rag/rag.bat`. Utility benchmarks (SQA/MME/MMBench/TextVQA) go
+through the same runner, see `rag/overnight.bat`.
 
-### 2. Safety judging (`rag/judge.py`)
-
-Needs the matching llama.cpp judge server running (see Setup). Resumable,
-one output file per (dataset, vlm, suffix) combination:
+### Step 2 — Safety judging (judge LLM)
 
 ```bash
 rag/judge.py --dataset SIUO --vlm internvl3_5-8b --judge qwen36
@@ -191,31 +234,21 @@ rag/judge.py --dataset SIUO --vlm internvl3_5-8b --judge qwen36
 
 rag/judge.py --dataset SIUO --vlm internvl3_5-8b --judge gemma4 --out _gemma4_full
 # → rag/result/JUDGED_SIUO_internvl3_5-8b_gemma4_full.json
-
-rag/judge.py --dataset SIUO --vlm internvl3_5-8b --judge qwen36 \
-  --subset subset_200.json --types baseline,ours --out _qwen36_run1 --num_workers 3
-# → rag/result/JUDGED_SIUO_internvl3_5-8b_qwen36_run1.json
 ```
 
 - `--judge`: `qwen36` (port 1234) | `gemma4` (port 1235)
 - `--types`: `original_response,empty_context,rag_on_response`
   (aliases `baseline,w/o KB,ours`); default `all`
-- `--subset`: optional manifest (e.g. `rag/subset_200.json`)
 - `--out`: filename suffix so repeated runs keep their own file
 
 The judge is text-only: it receives the image description, question,
-category, and response, and returns `{reason, is_safe}`.
+category, and response, and returns `{reason, is_safe}`. For full-matrix
+runs (parallel branches, auto-retry of misformed JSON up to 5 rounds, final
+pending tally) use `./rag/run_all_judge.sh [Q|G|ALL]` as a long-running
+background process; `rag/check_pending.py` (same args as `judge.py`) reports
+remaining samples per target.
 
-For full-matrix runs (parallel Qwen/Gemma branches, auto-retry of
-misformed JSON up to 5 rounds, final pending tally), use
-`./rag/run_all_judge.sh [Q|G|ALL]` as a long-running background process;
-`rag/check_pending.py` (same args as `judge.py`) reports remaining
-samples per target while it runs.
-
-### 3. Utility evaluation (`rag/eval.py` + scorers)
-
-Utility benchmarks (SQA/MME/MMBench/TextVQA) go through the same judge
-flow (`rag/eval.py`), then exact-match scoring:
+### Step 3 — Utility evaluation
 
 ```bash
 rag/eval.py --dataset MME-Benchmark --vlm internvl3_5-8b
@@ -223,36 +256,76 @@ rag/calculate_mme.py          # MME perception/cognition scores
 rag/calculate_mmbench.py       # MMBench accuracy
 ```
 
-### 4. Judge validation analysis (`rag/analyze_judge.py`)
+### Step 4 — Judge validation (the revision's new work)
 
-Regenerates all judge-validation numbers from the JSONs in `rag/result/`:
+Two experiments, both InternVL3.5-8B, both on llama.cpp (see §8):
 
 ```bash
-rag/analyze_judge.py all             # detailed markdown (per-run rates, flips)
-rag/analyze_judge.py paper           # compact tables (what the paper prints)
-rag/analyze_judge.py stability       # Qwen 3× repeat on the 200-subset
-rag/analyze_judge.py crossjudge      # Qwen full row vs Gemma-4 full row
-rag/analyze_judge.py all --out rows.json   # dump raw per-sample rows
+# (a) Stability: Qwen judge, 3 independent runs on the 200-sample subset
+for i in 1 2 3; do
+  rag/judge.py --dataset SIUO --vlm internvl3_5-8b --judge qwen36 \
+    --subset subset_200.json --types baseline,ours --out _qwen36_run$i
+done
+# (repeat per benchmark: SIUO / MSS-Bench / MM-Safety / SPA-VL_Harm)
+
+# (b) Cross-judge: Gemma-4 judge, full rows
+rag/judge.py --dataset SIUO --vlm internvl3_5-8b --judge gemma4 --out _gemma4_full
+# (repeat per benchmark)
 ```
 
-- **Stability:** Qwen 3.6 judge, 3 independent runs on the
-  200-sample subset → 94.0% of labels identical across all runs;
-  per-run safe-rates within ~1.8 pts of the mean on every benchmark.
-- **Cross-judge:** Qwen 3.6 vs Gemma-4 (different model family), full
-  rows, same samples → gain direction (SKAG > baseline) preserved under
-  both judges on all four benchmarks; label agreement 82.8–97.4%.
+Then regenerate every validation number from the JSONs:
 
-NOTE: `rag/subset_200.json` is **label-balanced by construction**
-(safe/unsafe mix fixed regardless of benchmark), so its per-benchmark
-safe-rates intentionally differ from the full-benchmark rates in the
-main results table. Cross-judge numbers use full rows matching the
-main table.
+```bash
+rag/analyze_judge.py all        # detailed markdown (per-run rates, flips)
+rag/analyze_judge.py paper      # compact tables (what the paper prints)
+rag/analyze_judge.py stability  # (a) alone
+rag/analyze_judge.py crossjudge # (b) alone
+```
+
+NOTE: `rag/subset_200.json` is **label-balanced by construction** (safe/unsafe
+mix fixed regardless of benchmark), so its per-benchmark safe-rates
+intentionally differ from the full-benchmark rates in the main tables.
+Cross-judge numbers use full rows matching the main tables.
 
 ---
 
-## Results
+## 8. Why the judge moved from LM Studio to llama.cpp
 
-### SKAG (this work) — safe-response rate, %
+The original runs — all VLM generation and the Q0 headline judging pass —
+were served by **LM Studio**. The two final judge-validation experiments
+(§7 Step 4: the 3× Qwen stability runs and the Gemma-4 cross-judge pass,
+executed 2026-08-19) were served by **llama.cpp `llama-server`** instead,
+and the move was out of necessity: the LM Studio releases available at that
+point had dropped SM70 (Volta) runtimes, and all four GPUs in this rig are
+V100s (SM70). llama.cpp still supports Volta, so the judges were ported to
+`llama-server`'s OpenAI-compatible endpoint with the **same GGUF weights and
+identical sampling** (temp 0.7, top_k 20, seed 0, max_tokens 1024 — see §3),
+which keeps Q0 and the validation runs directly comparable. This is footnoted
+in the paper.
+
+---
+
+## 9. A note on provenance
+
+Apologies for the inconsistency: part of the experiment was run on **Windows**
+(the original generation matrix and the Q0 judging pass — hence the `.bat`
+drivers, the `C:\Users\...` paths inside some result JSONs, and LM Studio,
+which we ran in its native Windows build), and the final validation
+experiments were run on **Ubuntu Linux** with llama.cpp, on the machine in
+§2. The code is cross-platform; the two platform-specific rough edges are
+documented in §5 (SIUO folder case, backslash paths) and are the only places
+a Windows/Linux difference is visible in the tree.
+
+---
+
+## 10. Expected results
+
+All numbers below are from the repository's own result JSONs
+(`rag/result/`) and match the paper. Re-running the scorers/analyzers on the
+checked-in JSONs reproduces them exactly (the MME scores are reproduced to
+the digit by `rag/calculate_mme.py`).
+
+### Safety: safe-response rate, % (main result)
 
 | Model | MSS-Bench | | SIUO | | MM-SafetyBench | | SPA-VL-Harm | |
 |---|---|---|---|---|---|---|---|---|
@@ -267,24 +340,28 @@ main table.
 Sample counts: MSS-Bench 299–300, SIUO 167, MM-SafetyBench 197–200,
 SPA-VL-Harm 259–265 per model.
 
-### ECSO (reproduced, `exp_ecso/`)
+### Ablation (InternVL3.5-8B), safe-response rate %
 
-| Model | MSS-Bench | SIUO | MM-SafetyBench | SPA-VL-Harm |
+| Dataset | Baseline | w/o KB | w/ KB |
+|---|---|---|---|
+| MSSBench | 20.33 | 38.67 | **63.00** |
+| SIUO | 29.34 | 45.51 | **63.47** |
+| MM-SafetyBench | 76.14 | 90.86 | **95.43** |
+| SPA-VL | 83.40 | 94.72 | **96.98** |
+
+The KB drives most of the gain, largest on the implicit-attack benchmarks
+(MSSBench +24.33 pts, SIUO +17.96 pts over w/o KB).
+
+### Utility (InternVL3.5 family) — deviations ≤ ±2% (SQA/TVQA), ≤ ±5% (MME)
+
+| Model | S-QA ↑ | T-VQA ↑ | MME-C ↑ | MME-P ↑ |
 |---|---|---|---|---|
-| internvl3.5-4b | 25 | 29 | 73 | 88 |
-| internvl3.5-8b | 21 | 34 | 83 | 91 |
-| internvl3.5-14b | 26 | 38 | 82 | 89 |
-| qwen/qwen3-vl-4b | 46 | 43 | 84 | 88 |
-| qwen/qwen3-vl-8b | 63 | 54 | 84 | 91 |
-| zai-org/glm-4.6v-flash | 27 | 31 | 71 | 74 |
-
-### ETA (reproduced, `exp_eta/`)
-
-| Model | MSS-Bench | SIUO | MM-SafetyBench | SPA-VL-Harm |
-|---|---|---|---|---|
-| internvl3.5-4b | 25 | 37 | 72 | 80 |
-| internvl3.5-8b | 23 | 36 | 80 | 82 |
-| internvl3.5-14b | 24 | 38 | 80 | 84 |
+| InternVL3.5-4B | 76.47% | 69.70% | 477.22 | 1277.15 |
+| **+ Ours** | **76.96%** | 69.19% | **501.39** | 1275.11 |
+| InternVL3.5-8B | **84.31%** | 69.70% | **549.17** | 1380.17 |
+| **+ Ours** | 83.82% | **71.72%** | 539.44 | 1374.58 |
+| InternVL3.5-14B | **86.70%** | **75.38%** | 563.89 | 1468.69 |
+| **+ Ours** | 85.22% | 73.37% | **589.72** | 1446.72 |
 
 ### Judge stability (Qwen 3.6, 200-subset, 3 repeat runs)
 
@@ -315,14 +392,27 @@ per-run safe-rates stay within ~1–2 pts of the mean.
 | SPAVLH | baseline | 265 | 83.4 | 92.8 | 89.8% |
 | SPAVLH | ours | 265 | 97.0 | 99.6 | 97.4% |
 
-`safe%` = fraction the judge labels safe; agreement = fraction of
-samples where both judges concur. +Ours beats baseline under **both**
-judge families on every benchmark (Gemma's deltas are smaller — it is
-stricter on baselines, looser on ours — but same sign and order).
+`safe%` = fraction the judge labels safe; agreement = fraction of samples
+where both judges concur. +Ours beats baseline under **both** judge families
+on every benchmark (Gemma's deltas are smaller — it is stricter on
+baselines, looser on ours — but same sign and order).
 
-The headline table was produced over LM Studio transport; the Q1–Q3 / G0
-validation runs used llama.cpp with the same GGUFs and identical
-sampling (see Setup), so results are directly comparable.
+### Baselines (reproduced)
+
+| ECSO (`exp_ecso/`) | MSS-Bench | SIUO | MM-SafetyBench | SPA-VL-Harm |
+|---|---|---|---|---|
+| internvl3.5-4b | 25 | 29 | 73 | 88 |
+| internvl3.5-8b | 21 | 34 | 83 | 91 |
+| internvl3.5-14b | 26 | 38 | 82 | 89 |
+| qwen/qwen3-vl-4b | 46 | 43 | 84 | 88 |
+| qwen/qwen3-vl-8b | 63 | 54 | 84 | 91 |
+| zai-org/glm-4.6v-flash | 27 | 31 | 71 | 74 |
+
+| ETA (`exp_eta/`) | MSS-Bench | SIUO | MM-SafetyBench | SPA-VL-Harm |
+|---|---|---|---|---|
+| internvl3.5-4b | 25 | 37 | 72 | 80 |
+| internvl3.5-8b | 23 | 36 | 80 | 82 |
+| internvl3.5-14b | 24 | 38 | 80 | 84 |
 
 ---
 
@@ -337,20 +427,41 @@ sampling (see Setup), so results are directly comparable.
 | `EVALED_<PREFIX>_<vlm>.json` | utility-benchmark answers |
 
 `<PREFIX>` ∈ `SIUO`, `MSSB`, `MMSB`, `SPAVLH`, `SQA`, `MME`, `MMBENCH`,
-`TVQA`; `<vlm>` is the vlm id with `/` → `__`
-(e.g. `qwen__qwen3-vl-4b`, `zai-org__glm-4.6v-flash`). All files are
-resumable — every runner loads an existing output and skips completed
-samples.
+`TVQA`; `<vlm>` is the vlm id with `/` → `__` (e.g. `qwen__qwen3-vl-4b`,
+`zai-org__glm-4.6v-flash`). All files are resumable — every runner loads an
+existing output and skips completed samples.
 
----
+## Repository layout
+
+```
+safety_rag/
+├── dataset/            # one subdir per benchmark: loaders + metadata
+├── rag/
+│   ├── run_rag.py      #   SKAG pipeline (generation)
+│   ├── rag.py          #   KB retrieval core (MinimalRAG)
+│   ├── judge.py        #   LLM-judge safety evaluation (resumable)
+│   ├── judge_openai.py #   judge client (llama.cpp OpenAI endpoint)
+│   ├── judge_server.sh #   start/stop the two judge servers
+│   ├── eval.py         #   utility-benchmark judge
+│   ├── calculate_mme.py / calculate_mmbench.py   # exact-match scorers
+│   ├── analyze_judge.py#   judge-validation analysis
+│   ├── check_pending.py#   resume helper
+│   ├── make_subset.py  #   builds subset_200.json
+│   ├── kbs/            #   the knowledge bases (kb_SIUO.md, kb_MSSB.md, ...)
+│   ├── models.py       #   VLM wrapper (LM Studio SDK)
+│   └── result/         #   ALL experiment outputs (tracked, resumable JSON)
+├── exp_ecso/           # ECSO baseline reproduction
+├── exp_eta/            # ETA baseline reproduction
+└── scripts/            # annotation splitting helpers
+```
 
 ## Baselines
 
 - `exp_ecso/` — ECSO reproduction (self-evaluation + intent-hint
-  regeneration). See its README (Chinese) and `prompts.yaml`.
-- `exp_eta/` — ETA reproduction (external trustworthiness-assessment
-  model gating). `ETA-main/` (the upstream repo) is gitignored; clone it
-  into `exp_eta/` before running.
+  regeneration). See its README and `prompts.yaml`.
+- `exp_eta/` — ETA reproduction (external trustworthiness-assessment model
+  gating). `ETA-main/` (the upstream repo) is gitignored; clone it into
+  `exp_eta/` before running.
 
 ## License
 
