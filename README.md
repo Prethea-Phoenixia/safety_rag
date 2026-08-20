@@ -1,23 +1,10 @@
 # SKAG: Safety Knowledge Augmented Generation
 
-**Reproduction guide.** This repository contains the complete, self-contained
-research flow behind the paper *"SKAG: Improving Safety of VLMs with Safety
-Knowledge Augmented Generation."* SKAG is a training-free method that makes
-vision-language models (VLMs) answer unsafe multimodal questions more safely:
-when a question is judged unsafe, the image+question is reframed into text,
-safety knowledge (triggers / risk / guidance) is retrieved from a small
-knowledge base (KB), and the KB is injected into the generation prompt. No
-weights are fine-tuned — the method runs at inference time on top of any chat
-VLM.
-
-Everything below runs on **one local machine**. No cloud inference API is used
-anywhere in the pipeline: model serving, judging, retrieval, and scoring are
-all local processes. HuggingFace is used only to *download* weights and
-datasets.
+This repository contains the research code & result for the paper *"SKAG: Improving Safety of VLMs with Safety Knowledge Augmented Generation."* 
 
 ---
 
-## 1. What the pipeline does
+## 1. Flow
 
 ```
 image + question
@@ -35,53 +22,29 @@ image + question
 `empty_context` (ablation, step 5 with no KB) is produced with the
 `--include_empty` flag. All five stages are in `rag/run_rag.py` + `rag/rag.py`;
 all judging is in `rag/judge.py` / `rag/eval.py`; all result JSONs live in
-`rag/result/` and every runner is **resumable**.
+`rag/result/` and every runner is resumable.
 
 ---
 
 ## 2. Hardware and software environment
+- Hardware: 2x V100 SXM2 32GB. Modern GPU with 24-32GB VRAM should suffice.
+- Software:
+  - Python 3.12 under Linux
+  - [llama.cpp](https://github.com/ggml-org/llama.cpp) if using V100, build from source for SM70 support
+  - LM Studio if using more recent GPUs
 
-The experiments were run on the following single node:
-
-| Component | Specification |
-|---|---|
-| Board | HUANANZHI X99-TF V6.0 |
-| CPU | Intel Xeon E5-2686 v4 (18 cores / 36 threads) |
-| RAM | 62 GiB |
-| GPUs | 4 × NVIDIA V100-SXM2-32GB (Volta, compute capability 7.0) |
-| GPU fabric | PLX PEX 8748 48-lane PCIe Gen3 switch; NVLink pairs 0↔1 and 2↔3; the 0/1 ↔ 2/3 boundary is a PCIe PIX link (avoid P2P across it) |
-| Storage | Micron 3500 2 TB NVMe |
-| OS | Ubuntu Linux (final experiments); earlier experiments on Windows — see [§9](#9-a-note-on-provenance) |
-
-Practical consequences of the GPU fabric:
-
-- The judge servers tensor-split across **one NVLink pair** (GPUs 0 and 1)
-  only. Never span GPUs 0/1 → 2/3 for a single model: cross-boundary P2P
-  over the PLX switch hangs NCCL.
-- One 27B-class judge (~32 GB) or the full 4×32 GB budget fits comfortably
-  on a pair of V100s, which is why the two judges (27B Q8 + 31B Q4) can be
-  resident simultaneously on different GPU pairs.
-
-Software: Python 3.12, PyTorch with CUDA 12.6 (pinned in
-`requirements126.txt`; `requirements130.txt` is the alternate lineup snapshot),
-LM Studio, and [llama.cpp](https://github.com/ggml-org/llama.cpp)
-(`llama-server`, any recent build that still supports SM70).
+Note: the project was originally ran on Windows w/ LM Studio, however V100/SM70 support was dropped by LM Studio in recent versions around May/June. As a result the repository is in a partially migrated state, moving from LM Studio to directly using llama.cpp on Linux. Minor changes to API may be required for full replication if using V100, but otherwise newer GPUs are not affected.
 
 ---
 
-## 3. External services (all locally hosted)
+## 3. Local Services 
 
 | Service | Role | Port |
 |---|---|---|
-| **LM Studio** | serves the chat VLMs (generation + the original Q0 judging pass) | 1234 (default) |
+| **LM Studio** | serves the chat VLMs (generation & judge) | 1234 (default) |
 | **llama.cpp `llama-server`** ×2 | serves the two judge LLMs (OpenAI-compatible HTTP API) | 1234 (qwen36), 1235 (gemma4) |
 | **sentence-transformers** | local embedding model for KB retrieval (auto-downloads on first use) | in-process |
 | **HuggingFace Hub** | weight + dataset *downloads only* | — |
-
-⚠️ **Port collision:** LM Studio's default API port is also 1234. Stop LM
-Studio before starting the qwen36 judge, and vice versa. Generation and
-judging are sequential phases in the pipeline, so they never actually
-overlap.
 
 The judge servers are managed by `rag/judge_server.sh`:
 
@@ -92,14 +55,9 @@ The judge servers are managed by `rag/judge_server.sh`:
 ./rag/judge_server.sh stop all         # note: `stop` takes `all`, not `both`
 ./rag/judge_server.sh status
 ```
+Flags are fixed in the script: `--split-mode tensor` on `CUDA_VISIBLE_DEVICES=0,1`,`--ctx-size 8192 --parallel 2` (context is split **per slot**, so each request gets 4096 tokens — with more parallel slots long judge prompts truncate mid-JSON), and `--reasoning off` (without it the Qwen judge's thinking mode eats the 1024-token output budget). Judge sampling is hardcoded identically for both judges in `rag/judge_openai.py`: temp 0.7, top_k 20, top_p 1.0, min_p 0.0, repeat_penalty 1.0, max_tokens 1024, seed 0.
 
-Flags are fixed in the script: `--split-mode tensor` on `CUDA_VISIBLE_DEVICES=0,1`,
-`--ctx-size 8192 --parallel 2` (context is split **per slot**, so each request
-gets 4096 tokens — with more parallel slots long judge prompts truncate
-mid-JSON), and `--reasoning off` (without it the Qwen judge's thinking mode
-eats the 1024-token output budget). Judge sampling is hardcoded identically
-for both judges in `rag/judge_openai.py`: temp 0.7, top_k 20, top_p 1.0,
-min_p 0.0, repeat_penalty 1.0, max_tokens 1024, seed 0.
+Adjust server scripts, `CUDA_VISIBLE_DEVICES` and `--parallel` flags as necessary if using different setups.
 
 ---
 
@@ -131,10 +89,8 @@ identifier exactly):
 
 ## 5. Data preparation
 
-All dataset loaders resolve paths **relative to their own module** inside
-`dataset/`, so the tracked metadata files must stay where they are. Image
-folders are large and gitignored — place them yourself (`.gitignore` lists
-exactly which paths are excluded). Tracked = metadata; you provide the images.
+All dataset loaders resolve paths relative to their own module inside `dataset/`, so the tracked metadata files must stay where they are. Image
+folders are large and gitignored — place them yourself. Tracked = metadata; you provide the images.
 
 | Benchmark | Tracked metadata (in repo) | Images you must place | Count | Source |
 |---|---|---|---|---|
@@ -148,16 +104,9 @@ exactly which paths are excluded). Tracked = metadata; you provide the images.
 | TextVQA | `dataset/TextVQA/TextVQA_0.5.1_val.json` (+ Rosetta OCR file) | `dataset/TextVQA/val_images/<image_id>.jpg` | 5000 val questions (loader draws 200, seed 6) | official TextVQA val split |
 | VLSU | `dataset/VLSU/VLSU.csv` | `dataset/VLSU/images/<uuid>.{jpg,png}` | — | legacy / reference only (see quirks) |
 
-The safety-benchmark loaders consume the **annotated** variants
-(`*_annotated.json`), produced from the raw benchmarks by
-`scripts/split_mmsb_annotated.py`, `split_mss_annotated.py`,
-`split_spa_vl_annotated.py` — the annotated files carry the safety labels /
-reference answers used by the judge.
+The safety-benchmark loaders consume the annotated variants (`*_annotated.json`), produced from the raw benchmarks by `scripts/split_mmsb_annotated.py`, `split_mss_annotated.py`, `split_spa_vl_annotated.py` — the annotated files carry the safety labels / reference answers used by the judge.
 
-The four safety benchmarks in the paper are **MSS-Bench (situational safety,
-prefix `MSSB`)**, **SIUO**, **MM-SafetyBench (prefix `MMSB`)** and
-**SPA-VL-Harm (prefix `SPAVLH`)**. `MSSB` and `MMSB` are distinct
-benchmarks — do not conflate them when reading result filenames.
+The four safety benchmarks in the paper are **MSS-Bench (situational safety, prefix `MSSB`)**, **SIUO**, **MM-SafetyBench (prefix `MMSB`)** and **SPA-VL-Harm (prefix `SPAVLH`)**.
 
 ### Known data quirks
 
@@ -305,20 +254,8 @@ in the paper.
 
 ---
 
-## 9. A note on provenance
 
-Apologies for the inconsistency: part of the experiment was run on **Windows**
-(the original generation matrix and the Q0 judging pass — hence the `.bat`
-drivers, the `C:\Users\...` paths inside some result JSONs, and LM Studio,
-which we ran in its native Windows build), and the final validation
-experiments were run on **Ubuntu Linux** with llama.cpp, on the machine in
-§2. The code is cross-platform; the two platform-specific rough edges are
-documented in §5 (SIUO folder case, backslash paths) and are the only places
-a Windows/Linux difference is visible in the tree.
-
----
-
-## 10. Expected results
+## 9. Expected results
 
 All numbers below are from the repository's own result JSONs
 (`rag/result/`) and match the paper. Re-running the scorers/analyzers on the
